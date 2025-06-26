@@ -215,6 +215,7 @@ func main() {
 	// Command line flags
 	var testMode = flag.Bool("test", false, "Run in test mode - don't post to Lemmy, just show what would be posted")
 	var configFile = flag.String("config", "config.json", "Configuration file path")
+	var loopMode = flag.Bool("loop", false, "Run in continuous monitoring mode - posts daily at 4:00 AM")
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {
@@ -241,6 +242,32 @@ func main() {
 		log.Printf("🧪 TEST-MODUS: Keine Posts werden an Lemmy gesendet!")
 	}
 
+	if *loopMode {
+		log.Printf("🔄 LOOP-MODUS: Starte kontinuierliche Überwachung...")
+		log.Printf("Posts werden täglich um 4:00 Uhr erstellt")
+		
+		// Kontinuierliche Überwachung
+		for {
+			runWeatherPosting(dbPath, config, *testMode)
+			
+			// Berechne nächsten Lauf um 4:00 Uhr
+			now := time.Now()
+			nextRun := time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
+			if now.After(nextRun) {
+				nextRun = nextRun.AddDate(0, 0, 1) // Morgen um 4:00 Uhr
+			}
+			
+			sleepDuration := nextRun.Sub(now)
+			log.Printf("Nächster Lauf um %s (in %v)", nextRun.Format("02.01.2006 15:04:05"), sleepDuration)
+			time.Sleep(sleepDuration)
+		}
+	} else {
+		// Einmalige Ausführung
+		runWeatherPosting(dbPath, config, *testMode)
+	}
+}
+
+func runWeatherPosting(dbPath string, config Config, testMode bool) {
 	loc, err := time.LoadLocation("Europe/Berlin")
 	if err != nil {
 		log.Fatalf("timezone: %v", err)
@@ -272,7 +299,43 @@ func main() {
 	}
 
 	// Wetterstatistik erstellen
-
+	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Sonnenstunden: %d h (Vortag: %d h) Details: https://groloe.wetter.foxel.org/week.html`, 
+	statsY.rainSum, statsV.rainSum,
+	statsY.sunHours, statsV.sunHours)
+	
+	// Emojis basierend auf Wetterbedingungen
+	var emojis []string
+	if statsY.rainSum > 0 {
+		emojis = append(emojis, "🌧️ ")
+	}
+	if statsY.tMax >= 35 {
+		emojis = append(emojis, "🏜️ ")
+	} else if statsY.tMax >= 30 {
+		emojis = append(emojis, "🌡️ ")
+	} else if statsY.tMax >= 25 {
+		emojis = append(emojis, "☀️ ")
+	}
+	if statsY.tMin < 0 {
+		emojis = append(emojis, "❄️ ")
+	}
+	if statsY.tMax < 0 {
+		emojis = append(emojis, "🧊 ")
+	}
+	if statsY.tMin >= 20 {
+		emojis = append(emojis, "🌙 ")
+	}
+	
+	// Emoji-String erstellen
+	emojiString := ""
+	if len(emojis) > 0 {
+		emojiString = strings.Join(emojis, " ") + " "
+	}
+	
+	title := fmt.Sprintf(`%sWetterstatistik für Overath %s: Temperatur %.1f bis %.1f °C (Vortag: %.1f bis %.1f  °C)`, 
+		emojiString,
+		startYesterday.Format("02.01.2006"),
+		statsY.tMax, statsY.tMin, statsV.tMax,
+		statsV.tMin)
 
 	// Ausgabe
 	fmt.Printf("Statistik für Overath %s: (Vortag)\n", startYesterday.Format("02.01.2006"))
@@ -281,16 +344,8 @@ func main() {
 	fmt.Printf("  Niederschlag:       %.1f mm (%.1f mm)\n", statsY.rainSum, statsV.rainSum)
 	fmt.Printf("  Sonnenstunden:      %d h (%d h)\n", statsY.sunHours, statsV.sunHours)
 
-	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Sonnenstunden: %d h (Vortag: %d h)`, 
-	statsY.rainSum, statsV.rainSum,
-	statsY.sunHours, statsV.sunHours)
-title := fmt.Sprintf(`Wetterstatistik für Overath %s: Temperatur %.1f bis %.1f °C (Vortag: %.1f bis %.1f  °C)`, 
-			startYesterday.Format("02.01.2006"),
-statsY.tMax, statsY.tMin, statsV.tMax,
- statsV.tMin)
-
- // Lemmy-Posting (nur wenn nicht im Test-Modus)
-	if !*testMode && config.LemmyPassword != "CHANGEME" {
+	// Lemmy-Posting (nur wenn nicht im Test-Modus)
+	if !testMode && config.LemmyPassword != "CHANGEME" {
 		log.Printf("Versuche Post an Lemmy zu senden...")
 		
 		// Login bei Lemmy
@@ -308,7 +363,6 @@ statsY.tMax, statsY.tMin, statsV.tMax,
 		}
 
 		// Post erstellen
-
 		err = lemmyCreatePost(config.LemmyServer, jwt, communityID, title, weatherText)
 		if err != nil {
 			log.Printf("Fehler beim Erstellen des Posts: %v", err)
@@ -316,7 +370,7 @@ statsY.tMax, statsY.tMin, statsV.tMax,
 		}
 
 		log.Printf("Wetterstatistik erfolgreich an Lemmy gepostet!")
-	} else if *testMode {
+	} else if testMode {
 		fmt.Printf("\n=== TEST-MODUS: Lemmy-Post würde so aussehen ===\n")
 		fmt.Printf("Titel: %s\n", title)
 		fmt.Printf("Body:\n%s\n", weatherText)
