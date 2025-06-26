@@ -1,0 +1,327 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+// Konfiguration der Schwellwerte
+const (
+	sunThreshold = 120.0 // W/m² – Strahlung ab dem eine Stunde als Sonnenstunde zählt
+)
+
+// Config enthält die Konfiguration für das Programm
+type Config struct {
+	LemmyServer    string `json:"lemmy_server"`
+	LemmyCommunity string `json:"lemmy_community"`
+	LemmyUsername  string `json:"lemmy_username"`
+	LemmyPassword  string `json:"lemmy_password"`
+	LemmyToken     string `json:"lemmy_token"`
+	LemmyTokenExp  time.Time `json:"lemmy_token_exp"`
+}
+
+// LemmyLoginResponse ist die Antwortstruktur für den Lemmy-Login
+type LemmyLoginResponse struct {
+	Jwt    string `json:"jwt"`
+	UserId int    `json:"id"`
+}
+
+type dayStats struct {
+	tMax, tMin, rainSum float64
+	sunHours           int
+}
+
+func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error) {
+	var s dayStats
+
+	// 1) Tagesmax/min + Gesamtniederschlag
+	const qSummary = `
+		SELECT MAX(outTemp), MIN(outTemp), IFNULL(SUM(rain),0)
+		FROM archive
+		WHERE dateTime >= ? AND dateTime < ?;`
+	if err := db.QueryRow(qSummary, start, end).Scan(&s.tMax, &s.tMin, &s.rainSum); err != nil {
+		return s, err
+	}
+
+	// 2) Stunden zählen
+	const qHourly = `
+		SELECT dateTime, rain, maxSolarRad
+		FROM archive
+		WHERE dateTime >= ? AND dateTime < ?;`
+	rows, err := db.Query(qHourly, start, end)
+	if err != nil {
+		return s, err
+	}
+	defer rows.Close()
+
+	seenSun := make(map[int]struct{})
+
+	for rows.Next() {
+		var ts int64
+		var rain float64
+		var maxSolarRad sql.NullFloat64
+		if err := rows.Scan(&ts, &rain, &maxSolarRad); err != nil {
+			return s, err
+		}
+		h := time.Unix(ts, 0).In(loc).Hour()
+		if maxSolarRad.Valid && maxSolarRad.Float64 >= sunThreshold {
+			seenSun[h] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return s, err
+	}
+
+	s.sunHours = len(seenSun)
+	return s, nil
+}
+
+// DefaultConfig gibt die Standard-Konfiguration zurück
+func DefaultConfig() Config {
+	return Config{
+		LemmyServer:    "https://natur.23.nu",
+		LemmyCommunity: "wetter",
+		LemmyUsername:  "wetterbot",
+		LemmyPassword:  "CHANGEME",
+		LemmyToken:     "",
+		LemmyTokenExp:  time.Time{},
+	}
+}
+
+// loadConfig lädt die Konfiguration aus einer JSON-Datei oder erstellt eine Standard-Konfiguration
+func loadConfig(configFile string) (Config, error) {
+	config := DefaultConfig()
+
+	if configFile != "" {
+		data, err := os.ReadFile(configFile)
+		if err == nil {
+			err = json.Unmarshal(data, &config)
+			if err != nil {
+				return config, fmt.Errorf("Fehler beim Parsen der Konfigurationsdatei: %v", err)
+			}
+		}
+	}
+
+	return config, nil
+}
+
+// saveConfig speichert die Konfiguration in eine JSON-Datei
+func saveConfig(config Config, configFile string) error {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("Fehler beim Marshalling der Konfiguration: %v", err)
+	}
+
+	return os.WriteFile(configFile, data, 0644)
+}
+
+func lemmyLogin(serverURL, username, password string) (string, error) {
+	loginUrl := serverURL + "/api/v3/user/login"
+	payload := map[string]string{
+		"username_or_email": username,
+		"password":          password,
+	}
+	data, _ := json.Marshal(payload)
+	resp, err := http.Post(loginUrl, "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		return "", fmt.Errorf("Lemmy-Login fehlgeschlagen: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("Fehler beim Lesen der Login-Antwort: %v", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("Lemmy-Login HTTP %d - Antwort: %s", resp.StatusCode, string(body))
+	}
+
+	var loginResp LemmyLoginResponse
+	if err := json.Unmarshal(body, &loginResp); err != nil {
+		return "", fmt.Errorf("Lemmy-Login JSON-Fehler: %v - Antwort: %s", err, string(body))
+	}
+	return loginResp.Jwt, nil
+}
+
+func lemmyGetCommunityID(serverURL, jwt, communityName string) (int, error) {
+	url := serverURL + "/api/v3/community?name=" + communityName
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("Community-GET HTTP %d", resp.StatusCode)
+	}
+	var respData struct {
+		CommunityView struct {
+			Community struct {
+				Id int `json:"id"`
+			} `json:"community"`
+		} `json:"community_view"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
+		return 0, err
+	}
+	return respData.CommunityView.Community.Id, nil
+}
+
+func lemmyCreatePost(serverURL, jwt string, communityID int, title, body string) error {
+	postUrl := serverURL + "/api/v3/post"
+	payload := map[string]interface{}{
+		"name":         title,
+		"body":         body,
+		"community_id": communityID,
+	}
+	data, _ := json.Marshal(payload)
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", postUrl, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Post-Erstellung HTTP %d - Antwort: %s", resp.StatusCode, string(body))
+	}
+	log.Printf("Post erfolgreich erstellt: %s", title)
+	return nil
+}
+
+func main() {
+	// Command line flags
+	var testMode = flag.Bool("test", false, "Run in test mode - don't post to Lemmy, just show what would be posted")
+	var configFile = flag.String("config", "config.json", "Configuration file path")
+	flag.Parse()
+
+	if len(flag.Args()) != 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] /path/to/weewx.sdb\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Flags:\n")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	dbPath := flag.Args()[0]
+
+	// Konfiguration laden
+	config, err := loadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Fehler beim Laden der Konfiguration: %v", err)
+	}
+
+	// Konfiguration speichern (falls sie nicht existierte)
+	err = saveConfig(config, *configFile)
+	if err != nil {
+		log.Printf("Warnung: Konfiguration konnte nicht gespeichert werden: %v", err)
+	}
+
+	if *testMode {
+		log.Printf("🧪 TEST-MODUS: Keine Posts werden an Lemmy gesendet!")
+	}
+
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		log.Fatalf("timezone: %v", err)
+	}
+
+	now := time.Now().In(loc)
+	yesterday := now.AddDate(0, 0, -1)
+	dayBefore := now.AddDate(0, 0, -2)
+
+	startYesterday := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), 0, 0, 0, 0, loc)
+	endYesterday := startYesterday.AddDate(0, 0, 1)
+
+	startDayBefore := time.Date(dayBefore.Year(), dayBefore.Month(), dayBefore.Day(), 0, 0, 0, 0, loc)
+	endDayBefore := startDayBefore.AddDate(0, 0, 1)
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		log.Fatalf("open DB: %v", err)
+	}
+	defer db.Close()
+
+	statsY, err := getStats(db, loc, startYesterday.UTC().Unix(), endYesterday.UTC().Unix())
+	if err != nil {
+		log.Fatalf("yesterday stats: %v", err)
+	}
+	statsV, err := getStats(db, loc, startDayBefore.UTC().Unix(), endDayBefore.UTC().Unix())
+	if err != nil {
+		log.Fatalf("vorgestern stats: %v", err)
+	}
+
+	// Wetterstatistik erstellen
+
+
+	// Ausgabe
+	fmt.Printf("Statistik für Overath %s: (Vortag)\n", startYesterday.Format("02.01.2006"))
+	fmt.Printf("  Höchsttemperatur:   %.1f °C (%.1f °C)\n", statsY.tMax, statsV.tMax)
+	fmt.Printf("  Tiefsttemperatur:   %.1f °C (%.1f °C)\n", statsY.tMin, statsV.tMin)
+	fmt.Printf("  Niederschlag:       %.1f mm (%.1f mm)\n", statsY.rainSum, statsV.rainSum)
+	fmt.Printf("  Sonnenstunden:      %d h (%d h)\n", statsY.sunHours, statsV.sunHours)
+
+	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Sonnenstunden: %d h (Vortag: %d h)`, 
+	statsY.rainSum, statsV.rainSum,
+	statsY.sunHours, statsV.sunHours)
+title := fmt.Sprintf(`Wetterstatistik für Overath %s: Temperatur %.1f bis %.1f °C (Vortag: %.1f bis %.1f  °C)`, 
+			startYesterday.Format("02.01.2006"),
+statsY.tMax, statsY.tMin, statsV.tMax,
+ statsV.tMin)
+
+ // Lemmy-Posting (nur wenn nicht im Test-Modus)
+	if !*testMode && config.LemmyPassword != "CHANGEME" {
+		log.Printf("Versuche Post an Lemmy zu senden...")
+		
+		// Login bei Lemmy
+		jwt, err := lemmyLogin(config.LemmyServer, config.LemmyUsername, config.LemmyPassword)
+		if err != nil {
+			log.Printf("Fehler beim Lemmy-Login: %v", err)
+			return
+		}
+
+		// Community-ID holen
+		communityID, err := lemmyGetCommunityID(config.LemmyServer, jwt, config.LemmyCommunity)
+		if err != nil {
+			log.Printf("Fehler beim Holen der Community-ID: %v", err)
+			return
+		}
+
+		// Post erstellen
+
+		err = lemmyCreatePost(config.LemmyServer, jwt, communityID, title, weatherText)
+		if err != nil {
+			log.Printf("Fehler beim Erstellen des Posts: %v", err)
+			return
+		}
+
+		log.Printf("Wetterstatistik erfolgreich an Lemmy gepostet!")
+	} else if *testMode {
+		fmt.Printf("\n=== TEST-MODUS: Lemmy-Post würde so aussehen ===\n")
+		fmt.Printf("Titel: %s\n", title)
+		fmt.Printf("Body:\n%s\n", weatherText)
+		fmt.Printf("=== ENDE TEST-MODUS ===\n")
+	} else {
+		log.Printf("Lemmy-Posting übersprungen (Passwort nicht konfiguriert)")
+	}
+}
