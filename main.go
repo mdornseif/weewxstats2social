@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -22,12 +23,16 @@ const (
 
 // Config enthält die Konfiguration für das Programm
 type Config struct {
-	LemmyServer    string `json:"lemmy_server"`
-	LemmyCommunity string `json:"lemmy_community"`
-	LemmyUsername  string `json:"lemmy_username"`
-	LemmyPassword  string `json:"lemmy_password"`
-	LemmyToken     string `json:"lemmy_token"`
+	LemmyServer    string    `json:"lemmy_server"`
+	LemmyCommunity string    `json:"lemmy_community"`
+	LemmyUsername  string    `json:"lemmy_username"`
+	LemmyPassword  string    `json:"lemmy_password"`
+	LemmyToken     string    `json:"lemmy_token"`
 	LemmyTokenExp  time.Time `json:"lemmy_token_exp"`
+
+	MastodonServer    string `json:"mastodon_server"`
+	MastodonToken     string `json:"mastodon_token"`
+	MastodonVisibility string `json:"mastodon_visibility"`
 }
 
 // LemmyLoginResponse ist die Antwortstruktur für den Lemmy-Login
@@ -49,8 +54,27 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 		SELECT MAX(outTemp), MIN(outTemp), IFNULL(SUM(rain),0)
 		FROM archive
 		WHERE dateTime >= ? AND dateTime < ?;`
-	if err := db.QueryRow(qSummary, start, end).Scan(&s.tMax, &s.tMin, &s.rainSum); err != nil {
+	var tMax, tMin, rainSum sql.NullFloat64
+	if err := db.QueryRow(qSummary, start, end).Scan(&tMax, &tMin, &rainSum); err != nil {
 		return s, err
+	}
+	if tMax.Valid {
+		s.tMax = tMax.Float64
+	} else {
+		s.tMax = math.NaN()
+		fmt.Fprintf(os.Stderr, "Warnung: MAX(outTemp) ist NULL für Zeitraum %d-%d\n", start, end)
+	}
+	if tMin.Valid {
+		s.tMin = tMin.Float64
+	} else {
+		s.tMin = math.NaN()
+		fmt.Fprintf(os.Stderr, "Warnung: MIN(outTemp) ist NULL für Zeitraum %d-%d\n", start, end)
+	}
+	if rainSum.Valid {
+		s.rainSum = rainSum.Float64
+	} else {
+		s.rainSum = 0
+		fmt.Fprintf(os.Stderr, "Warnung: SUM(rain) ist NULL für Zeitraum %d-%d\n", start, end)
 	}
 
 	// 2) Stunden zählen
@@ -68,7 +92,7 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 
 	for rows.Next() {
 		var ts int64
-		var rain float64
+		var rain sql.NullFloat64
 		var maxSolarRad sql.NullFloat64
 		if err := rows.Scan(&ts, &rain, &maxSolarRad); err != nil {
 			return s, err
@@ -95,6 +119,9 @@ func DefaultConfig() Config {
 		LemmyPassword:  "CHANGEME",
 		LemmyToken:     "",
 		LemmyTokenExp:  time.Time{},
+		MastodonServer:    "",
+		MastodonToken:     "",
+		MastodonVisibility: "unlisted",
 	}
 }
 
@@ -211,6 +238,103 @@ func lemmyCreatePost(serverURL, jwt string, communityID int, title, body string)
 	return nil
 }
 
+// mastodonCreatePost postet einen Status zu Mastodon
+func mastodonCreatePost(server, token, text, visibility string) error {
+	url := server + "/api/v1/statuses"
+	payload := map[string]interface{}{
+		"status":     text,
+		"visibility": visibility,
+	}
+	data, _ := json.Marshal(payload)
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Mastodon-Post HTTP %d - Antwort: %s", resp.StatusCode, string(body))
+	}
+	log.Printf("Post erfolgreich an Mastodon erstellt.")
+	return nil
+}
+
+// lemmyPostWithRetry versucht einen Post an Lemmy zu senden und wiederholt alle 30 Minuten bei Fehlern
+func lemmyPostWithRetry(config Config, title, weatherText string, loopMode bool) {
+	const retryInterval = 30 * time.Minute
+	const maxRetries = 48 // Maximal 24 Stunden (48 * 30 Minuten) in Loop-Modus
+	
+	retryCount := 0
+	
+	for {
+		log.Printf("Versuche Post an Lemmy zu senden...")
+		
+		// Login bei Lemmy
+		jwt, err := lemmyLogin(config.LemmyServer, config.LemmyUsername, config.LemmyPassword)
+		if err != nil {
+			log.Printf("Fehler beim Lemmy-Login: %v", err)
+			if loopMode {
+				retryCount++
+				if retryCount >= maxRetries {
+					log.Printf("Maximale Anzahl von Wiederholungen erreicht (%d). Beende Retry-Versuch.", maxRetries)
+					return
+				}
+				log.Printf("Wiederhole in %v... (Versuch %d/%d)", retryInterval, retryCount, maxRetries)
+			} else {
+				log.Printf("Wiederhole in %v...", retryInterval)
+			}
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		// Community-ID holen
+		communityID, err := lemmyGetCommunityID(config.LemmyServer, jwt, config.LemmyCommunity)
+		if err != nil {
+			log.Printf("Fehler beim Holen der Community-ID: %v", err)
+			if loopMode {
+				retryCount++
+				if retryCount >= maxRetries {
+					log.Printf("Maximale Anzahl von Wiederholungen erreicht (%d). Beende Retry-Versuch.", maxRetries)
+					return
+				}
+				log.Printf("Wiederhole in %v... (Versuch %d/%d)", retryInterval, retryCount, maxRetries)
+			} else {
+				log.Printf("Wiederhole in %v...", retryInterval)
+			}
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		// Post erstellen
+		err = lemmyCreatePost(config.LemmyServer, jwt, communityID, title, weatherText)
+		if err != nil {
+			log.Printf("Fehler beim Erstellen des Posts: %v", err)
+			if loopMode {
+				retryCount++
+				if retryCount >= maxRetries {
+					log.Printf("Maximale Anzahl von Wiederholungen erreicht (%d). Beende Retry-Versuch.", maxRetries)
+					return
+				}
+				log.Printf("Wiederhole in %v... (Versuch %d/%d)", retryInterval, retryCount, maxRetries)
+			} else {
+				log.Printf("Wiederhole in %v...", retryInterval)
+			}
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		log.Printf("Wetterstatistik erfolgreich an Lemmy gepostet!")
+		return // Erfolgreich - beende die Schleife
+	}
+}
+
 func main() {
 	// Command line flags
 	var testMode = flag.Bool("test", false, "Run in test mode - don't post to Lemmy, just show what would be posted")
@@ -248,7 +372,7 @@ func main() {
 		
 		// Kontinuierliche Überwachung
 		for {
-			runWeatherPosting(dbPath, config, *testMode)
+			runWeatherPosting(dbPath, config, *testMode, true)
 			
 			// Berechne nächsten Lauf um 4:00 Uhr
 			now := time.Now()
@@ -263,11 +387,11 @@ func main() {
 		}
 	} else {
 		// Einmalige Ausführung
-		runWeatherPosting(dbPath, config, *testMode)
+		runWeatherPosting(dbPath, config, *testMode, false)
 	}
 }
 
-func runWeatherPosting(dbPath string, config Config, testMode bool) {
+func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode bool) {
 	loc, err := time.LoadLocation("Europe/Berlin")
 	if err != nil {
 		log.Fatalf("timezone: %v", err)
@@ -296,6 +420,12 @@ func runWeatherPosting(dbPath string, config Config, testMode bool) {
 	statsV, err := getStats(db, loc, startDayBefore.UTC().Unix(), endDayBefore.UTC().Unix())
 	if err != nil {
 		log.Fatalf("vorgestern stats: %v", err)
+	}
+
+	// Vor dem Posting: Prüfe auf NaN
+	if math.IsNaN(statsY.tMax) || math.IsNaN(statsY.tMin) || math.IsNaN(statsV.tMax) || math.IsNaN(statsV.tMin) {
+		log.Printf("Warnung: Ungültige Wetterdaten (NaN) – Posting wird übersprungen!")
+		return
 	}
 
 	// Wetterstatistik erstellen
@@ -346,30 +476,7 @@ func runWeatherPosting(dbPath string, config Config, testMode bool) {
 
 	// Lemmy-Posting (nur wenn nicht im Test-Modus)
 	if !testMode && config.LemmyPassword != "CHANGEME" {
-		log.Printf("Versuche Post an Lemmy zu senden...")
-		
-		// Login bei Lemmy
-		jwt, err := lemmyLogin(config.LemmyServer, config.LemmyUsername, config.LemmyPassword)
-		if err != nil {
-			log.Printf("Fehler beim Lemmy-Login: %v", err)
-			return
-		}
-
-		// Community-ID holen
-		communityID, err := lemmyGetCommunityID(config.LemmyServer, jwt, config.LemmyCommunity)
-		if err != nil {
-			log.Printf("Fehler beim Holen der Community-ID: %v", err)
-			return
-		}
-
-		// Post erstellen
-		err = lemmyCreatePost(config.LemmyServer, jwt, communityID, title, weatherText)
-		if err != nil {
-			log.Printf("Fehler beim Erstellen des Posts: %v", err)
-			return
-		}
-
-		log.Printf("Wetterstatistik erfolgreich an Lemmy gepostet!")
+		lemmyPostWithRetry(config, title, weatherText, loopMode)
 	} else if testMode {
 		fmt.Printf("\n=== TEST-MODUS: Lemmy-Post würde so aussehen ===\n")
 		fmt.Printf("Titel: %s\n", title)
@@ -377,5 +484,16 @@ func runWeatherPosting(dbPath string, config Config, testMode bool) {
 		fmt.Printf("=== ENDE TEST-MODUS ===\n")
 	} else {
 		log.Printf("Lemmy-Posting übersprungen (Passwort nicht konfiguriert)")
+	}
+
+	// Mastodon-Posting (optional, unabhängig von Lemmy)
+	mastodonErr := error(nil)
+	if config.MastodonServer != "" && config.MastodonToken != "" {
+		mastodonErr = mastodonCreatePost(config.MastodonServer, config.MastodonToken, title+"\n"+weatherText, config.MastodonVisibility)
+		if mastodonErr != nil {
+			log.Printf("Fehler beim Mastodon-Post: %v", mastodonErr)
+		} else {
+			log.Printf("Wetterstatistik erfolgreich an Mastodon gepostet!")
+		}
 	}
 }
