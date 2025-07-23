@@ -49,13 +49,13 @@ type dayStats struct {
 func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error) {
 	var s dayStats
 
-	// 1) Tagesmax/min + Gesamtniederschlag
+	// 1) Tagesmax/min
 	const qSummary = `
-		SELECT MAX(outTemp), MIN(outTemp), IFNULL(SUM(rain),0)
+		SELECT MAX(outTemp), MIN(outTemp)
 		FROM archive
 		WHERE dateTime >= ? AND dateTime < ?;`
-	var tMax, tMin, rainSum sql.NullFloat64
-	if err := db.QueryRow(qSummary, start, end).Scan(&tMax, &tMin, &rainSum); err != nil {
+	var tMax, tMin sql.NullFloat64
+	if err := db.QueryRow(qSummary, start, end).Scan(&tMax, &tMin); err != nil {
 		return s, err
 	}
 	if tMax.Valid {
@@ -70,14 +70,21 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 		s.tMin = math.NaN()
 		fmt.Fprintf(os.Stderr, "Warnung: MIN(outTemp) ist NULL für Zeitraum %d-%d\n", start, end)
 	}
-	if rainSum.Valid {
+
+	// 2) Tagesregenmenge aus archive_day_rain
+	const qRain = `SELECT sum FROM archive_day_rain WHERE dateTime >= ? AND dateTime < ? ORDER BY dateTime LIMIT 1;`
+	var rainSum sql.NullFloat64
+	if err := db.QueryRow(qRain, start, end).Scan(&rainSum); err != nil {
+		s.rainSum = 0
+		fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) ist NULL für Zeitraum %d-%d\n", start, end)
+	} else if rainSum.Valid {
 		s.rainSum = rainSum.Float64
 	} else {
 		s.rainSum = 0
-		fmt.Fprintf(os.Stderr, "Warnung: SUM(rain) ist NULL für Zeitraum %d-%d\n", start, end)
+		fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) ist NULL für Zeitraum %d-%d\n", start, end)
 	}
 
-	// 2) Stunden zählen
+	// 3) Sonnenstunden wie ursprünglich: Zähle Stunden mit maxSolarRad >= sunThreshold
 	const qHourly = `
 		SELECT dateTime, rain, maxSolarRad
 		FROM archive
@@ -461,7 +468,7 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 		emojiString = strings.Join(emojis, " ") + " "
 	}
 	
-	title := fmt.Sprintf(`%sWetterstatistik für Overath %s: Temperatur %.1f bis %.1f °C (Vortag: %.1f bis %.1f  °C)`, 
+	title := fmt.Sprintf(`%sWetterstatistik für Overath %s: Temperatur %.1f bis %.1f °C (Vortag: %.1f bis %.1f°C)`, 
 		emojiString,
 		startYesterday.Format("02.01.2006"),
 		statsY.tMax, statsY.tMin, statsV.tMax,
@@ -482,6 +489,17 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 		fmt.Printf("Titel: %s\n", title)
 		fmt.Printf("Body:\n%s\n", weatherText)
 		fmt.Printf("=== ENDE TEST-MODUS ===\n")
+		fmt.Printf("\n=== TEST-MODUS: Mastodon-Konfiguration ===\n")
+		fmt.Printf("Server: %s\nToken: %s\nVisibility: %s\n", config.MastodonServer, config.MastodonToken, config.MastodonVisibility)
+		fmt.Printf("=== ENDE MASTODON-KONFIG ===\n")
+		if config.MastodonServer != "" && config.MastodonToken != "" {
+			mastodonText := title + "\n" + weatherText
+			fmt.Printf("\n=== TEST-MODUS: Mastodon-Post wird simuliert ===\n")
+			fmt.Printf("%s\n", mastodonText)
+			fmt.Printf("=== ENDE TEST-MODUS MASTODON ===\n")
+			_ = mastodonCreatePost(config.MastodonServer, config.MastodonToken, mastodonText, config.MastodonVisibility)
+		}
+		return
 	} else {
 		log.Printf("Lemmy-Posting übersprungen (Passwort nicht konfiguriert)")
 	}
