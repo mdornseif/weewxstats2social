@@ -93,30 +93,6 @@ bash ./install.sh
 ./daystats -config /pfad/zur/config.json /var/lib/weewx/weewx.sdb
 ```
 
-## Service-Verwaltung
-
-Nach der Installation läuft das Programm als systemd-Service:
-
-```bash
-# Service-Status prüfen
-sudo systemctl status wetterstatistik-service
-
-# Service stoppen
-sudo systemctl stop wetterstatistik-service
-
-# Service starten
-sudo systemctl start wetterstatistik-service
-
-# Service neu starten
-sudo systemctl restart wetterstatistik-service
-
-# Logs anzeigen
-sudo journalctl -u wetterstatistik-service -f
-
-# Letzte 20 Log-Einträge
-sudo journalctl -u wetterstatistik-service -n 20
-```
-
 ## Konfiguration
 
 Die Konfigurationsdatei `config.json` enthält:
@@ -147,58 +123,3 @@ Statistik für Overath 25.06.2025: (Vortag)
   Sonnenstunden:      14 h (15 h)
 ```
 
-## Troubleshooting
-
-### Service startet nicht
-```bash
-# Logs prüfen
-sudo journalctl -u wetterstatistik-service -n 50
-
-# Manueller Test
-sudo -u wetterbot /usr/local/bin/wetterstatistik-service -test /var/lib/weewx/weewx.sdb
-```
-
-### Lemmy-Posting funktioniert nicht
-1. Prüfe die Konfiguration in `/opt/wetterstatistik/config.json`
-2. Teste die Anmeldedaten manuell
-3. Prüfe die Logs auf Fehlermeldungen
-
-### Datenbank nicht gefunden
-- Stelle sicher, dass weewx installiert ist
-- Prüfe den Pfad zur Datenbank: `/var/lib/weewx/weewx.sdb`
-- Passe den Pfad in `install.sh` an, falls nötig
-
-## Entwicklung
-
-### Abhängigkeiten
-- `github.com/mattn/go-sqlite3` - SQLite-Datenbanktreiber
-- Standard Go-Bibliotheken für HTTP, JSON, etc.
-
-### Build
-```bash
-go build -o daystats main.go
-```
-
-### Test
-```bash
-go test ./...
-```
-
-## Lizenz
-
-Dieses Projekt steht unter der MIT-Lizenz.
-
-## Beitragen
-
-1. Fork das Repository
-2. Erstelle einen Feature-Branch
-3. Committe deine Änderungen
-4. Push zum Branch
-5. Erstelle einen Pull Request
-
-## Support
-
-Bei Problemen oder Fragen:
-1. Prüfe die Logs: `sudo journalctl -u wetterstatistik-service -f`
-2. Teste manuell: `./daystats -test /var/lib/weewx/weewx.sdb`
-3. Erstelle ein Issue im Repository 
