@@ -19,6 +19,7 @@ import (
 // Konfiguration der Schwellwerte
 const (
 	sunThreshold = 120.0 // W/m² – Strahlung ab dem eine Stunde als Sonnenstunde zählt
+	drySpellThreshold = 3 // Anzahl Tage ohne Regen für Hinweis im Post
 )
 
 // Config enthält die Konfiguration für das Programm
@@ -342,11 +343,54 @@ func lemmyPostWithRetry(config Config, title, weatherText string, loopMode bool)
 	}
 }
 
+func parseNoaaRain(noaaFile string, date time.Time) (float64, error) {
+	f, err := os.Open(noaaFile)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	dateStr := date.Format("02.01")
+	var rainVal float64
+	found := false
+	buf := make([]byte, 4096)
+	var content string
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			content += string(buf[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, dateStr+" ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 4 {
+				// Feld 4 ist Regenmenge laut NOAA-Template
+				fmt.Sscanf(fields[3], "%f", &rainVal)
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return 0, fmt.Errorf("Kein Eintrag für %s in NOAA-Report", dateStr)
+	}
+	return rainVal, nil
+}
+
 func main() {
 	// Command line flags
 	var testMode = flag.Bool("test", false, "Run in test mode - don't post to Lemmy, just show what would be posted")
 	var configFile = flag.String("config", "config.json", "Configuration file path")
 	var loopMode = flag.Bool("loop", false, "Run in continuous monitoring mode - posts daily at 4:00 AM")
+	var noaaFile = flag.String("noaa", "", "NOAA report file for test comparison")
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {
@@ -379,7 +423,7 @@ func main() {
 		
 		// Kontinuierliche Überwachung
 		for {
-			runWeatherPosting(dbPath, config, *testMode, true)
+			runWeatherPosting(dbPath, config, *testMode, true, *noaaFile)
 			
 			// Berechne nächsten Lauf um 4:00 Uhr
 			now := time.Now()
@@ -394,11 +438,11 @@ func main() {
 		}
 	} else {
 		// Einmalige Ausführung
-		runWeatherPosting(dbPath, config, *testMode, false)
+		runWeatherPosting(dbPath, config, *testMode, false, *noaaFile)
 	}
 }
 
-func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode bool) {
+func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode bool, noaaFile string) {
 	loc, err := time.LoadLocation("Europe/Berlin")
 	if err != nil {
 		log.Fatalf("timezone: %v", err)
@@ -435,10 +479,53 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 		return
 	}
 
+	// Ermittle Trockenperiode (Tage seit letztem Regen)
+	daysSinceRain := 0
+	for i := 1; i < 30; i++ { // max. 30 Tage zurück
+		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -i)
+		end := start.AddDate(0, 0, 1)
+		var rainSum sql.NullFloat64
+		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime >= ? AND dateTime < ? ORDER BY dateTime LIMIT 1;", start.UTC().Unix(), end.UTC().Unix()).Scan(&rainSum); err != nil {
+			break // Fehler oder kein Eintrag -> abbrechen
+		}
+		if rainSum.Valid && rainSum.Float64 > 0 {
+			break // Es hat geregnet
+		}
+		daysSinceRain++
+	}
+
 	// Wetterstatistik erstellen
 	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Sonnenstunden: %d h (Vortag: %d h) Details: https://groloe.wetter.foxel.org/week.html`, 
-	statsY.rainSum, statsV.rainSum,
-	statsY.sunHours, statsV.sunHours)
+		statsY.rainSum, statsV.rainSum,
+		statsY.sunHours, statsV.sunHours)
+
+	// Trockenperiode- und Regenserien-Hinweis ergänzen
+	consecutiveRainDays := 0
+	for i := 1; i < 30; i++ {
+		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -i)
+		end := start.AddDate(0, 0, 1)
+		var rainSum sql.NullFloat64
+		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime >= ? AND dateTime < ? ORDER BY dateTime LIMIT 1;", start.UTC().Unix(), end.UTC().Unix()).Scan(&rainSum); err != nil {
+			break // Fehler oder kein Eintrag -> abbrechen
+		}
+		if rainSum.Valid && rainSum.Float64 > 0 {
+			consecutiveRainDays++
+		} else {
+			break // Kein Regen -> Serie endet
+		}
+	}
+
+	if daysSinceRain >= drySpellThreshold {
+		if statsY.rainSum > 0 {
+			weatherText += fmt.Sprintf("\nEs hat nach %d Tagen wieder geregnet.", daysSinceRain)
+		} else {
+			weatherText += fmt.Sprintf("\nEs hat seit %d Tagen nicht mehr geregnet.", daysSinceRain)
+			weatherText += fmt.Sprintf("\nEs gab seit %d Tagen keinen Regen.", daysSinceRain)
+		}
+	}
+	if consecutiveRainDays >= drySpellThreshold {
+		weatherText += fmt.Sprintf("\nEs regnet seit %d Tagen jeden Tag.", consecutiveRainDays)
+	}
 	
 	// Emojis basierend auf Wetterbedingungen
 	var emojis []string
@@ -480,6 +567,20 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 	fmt.Printf("  Tiefsttemperatur:   %.1f °C (%.1f °C)\n", statsY.tMin, statsV.tMin)
 	fmt.Printf("  Niederschlag:       %.1f mm (%.1f mm)\n", statsY.rainSum, statsV.rainSum)
 	fmt.Printf("  Sonnenstunden:      %d h (%d h)\n", statsY.sunHours, statsV.sunHours)
+
+	if testMode && noaaFile != "" {
+		noaaRain, err := parseNoaaRain(noaaFile, yesterday)
+		if err != nil {
+			fmt.Printf("NOAA-Report-Vergleich: Fehler: %v\n", err)
+		} else {
+			fmt.Printf("NOAA-Report: Tagesregenmenge für %s: %.1f mm\n", yesterday.Format("02.01.2006"), noaaRain)
+			if math.Abs(noaaRain-statsY.rainSum) < 0.01 {
+				fmt.Printf("Vergleich: ✅ Werte stimmen überein.\n")
+			} else {
+				fmt.Printf("Vergleich: ❌ Werte unterscheiden sich! (DB: %.2f mm, NOAA: %.2f mm)\n", statsY.rainSum, noaaRain)
+			}
+		}
+	}
 
 	// Lemmy-Posting (nur wenn nicht im Test-Modus)
 	if !testMode && config.LemmyPassword != "CHANGEME" {

@@ -230,8 +230,10 @@ main() {
     echo "  Logs: sudo journalctl -u wetterstatistik-service -f"
     echo ""
     echo "Konfiguration:"
-    echo "  Bearbeite: sudo nano /opt/wetterstatistik/config.json"
-    echo "  Test-Modus: sudo systemctl stop wetterstatistik-service && sudo -u $SERVICE_USER /usr/local/bin/wetterstatistik-service -test $DB_PATH"
+
+    # Service neu starten
+    echo "Starte wetterstatistik-service neu..."
+    sudo systemctl restart wetterstatistik-service
 }
 
 # Skript ausführen
