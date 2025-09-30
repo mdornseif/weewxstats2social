@@ -18,8 +18,8 @@ import (
 
 // Konfiguration der Schwellwerte
 const (
-	sunThreshold = 120.0 // W/m² – Strahlung ab dem eine Stunde als Sonnenstunde zählt
-	drySpellThreshold = 3 // Anzahl Tage ohne Regen für Hinweis im Post
+	sunThreshold      = 120.0 // W/m² – Strahlung ab dem eine Stunde als Sonnenstunde zählt
+	drySpellThreshold = 3     // Anzahl Tage ohne Regen für Hinweis im Post
 )
 
 // Config enthält die Konfiguration für das Programm
@@ -31,8 +31,8 @@ type Config struct {
 	LemmyToken     string    `json:"lemmy_token"`
 	LemmyTokenExp  time.Time `json:"lemmy_token_exp"`
 
-	MastodonServer    string `json:"mastodon_server"`
-	MastodonToken     string `json:"mastodon_token"`
+	MastodonServer     string `json:"mastodon_server"`
+	MastodonToken      string `json:"mastodon_token"`
 	MastodonVisibility string `json:"mastodon_visibility"`
 }
 
@@ -44,7 +44,7 @@ type LemmyLoginResponse struct {
 
 type dayStats struct {
 	tMax, tMin, rainSum float64
-	sunHours           int
+	sunHours            int
 }
 
 func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error) {
@@ -121,14 +121,14 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 // DefaultConfig gibt die Standard-Konfiguration zurück
 func DefaultConfig() Config {
 	return Config{
-		LemmyServer:    "https://natur.23.nu",
-		LemmyCommunity: "wetter",
-		LemmyUsername:  "wetterbot",
-		LemmyPassword:  "CHANGEME",
-		LemmyToken:     "",
-		LemmyTokenExp:  time.Time{},
-		MastodonServer:    "",
-		MastodonToken:     "",
+		LemmyServer:        "https://natur.23.nu",
+		LemmyCommunity:     "wetter",
+		LemmyUsername:      "wetterbot",
+		LemmyPassword:      "CHANGEME",
+		LemmyToken:         "",
+		LemmyTokenExp:      time.Time{},
+		MastodonServer:     "",
+		MastodonToken:      "",
 		MastodonVisibility: "unlisted",
 	}
 }
@@ -278,12 +278,12 @@ func mastodonCreatePost(server, token, text, visibility string) error {
 func lemmyPostWithRetry(config Config, title, weatherText string, loopMode bool) {
 	const retryInterval = 30 * time.Minute
 	const maxRetries = 48 // Maximal 24 Stunden (48 * 30 Minuten) in Loop-Modus
-	
+
 	retryCount := 0
-	
+
 	for {
 		log.Printf("Versuche Post an Lemmy zu senden...")
-		
+
 		// Login bei Lemmy
 		jwt, err := lemmyLogin(config.LemmyServer, config.LemmyUsername, config.LemmyPassword)
 		if err != nil {
@@ -420,18 +420,18 @@ func main() {
 	if *loopMode {
 		log.Printf("🔄 LOOP-MODUS: Starte kontinuierliche Überwachung...")
 		log.Printf("Posts werden täglich um 4:00 Uhr erstellt")
-		
+
 		// Kontinuierliche Überwachung
 		for {
 			runWeatherPosting(dbPath, config, *testMode, true, *noaaFile)
-			
+
 			// Berechne nächsten Lauf um 4:00 Uhr
 			now := time.Now()
 			nextRun := time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
 			if now.After(nextRun) {
 				nextRun = nextRun.AddDate(0, 0, 1) // Morgen um 4:00 Uhr
 			}
-			
+
 			sleepDuration := nextRun.Sub(now)
 			log.Printf("Nächster Lauf um %s (in %v)", nextRun.Format("02.01.2006 15:04:05"), sleepDuration)
 			time.Sleep(sleepDuration)
@@ -495,7 +495,7 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 	}
 
 	// Wetterstatistik erstellen
-	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Sonnenstunden: %d h (Vortag: %d h) Details: https://groloe.wetter.foxel.org/week.html`, 
+	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Sonnenstunden: %d h (Vortag: %d h) Details: https://groloe.wetter.foxel.org/week.html`,
 		statsY.rainSum, statsV.rainSum,
 		statsY.sunHours, statsV.sunHours)
 
@@ -520,13 +520,12 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 			weatherText += fmt.Sprintf("\nEs hat nach %d Tagen wieder geregnet.", daysSinceRain)
 		} else {
 			weatherText += fmt.Sprintf("\nEs hat seit %d Tagen nicht mehr geregnet.", daysSinceRain)
-			weatherText += fmt.Sprintf("\nEs gab seit %d Tagen keinen Regen.", daysSinceRain)
 		}
 	}
 	if consecutiveRainDays >= drySpellThreshold {
 		weatherText += fmt.Sprintf("\nEs regnet seit %d Tagen jeden Tag.", consecutiveRainDays)
 	}
-	
+
 	// Emojis basierend auf Wetterbedingungen
 	var emojis []string
 	if statsY.rainSum > 0 {
@@ -548,14 +547,14 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 	if statsY.tMin >= 20 {
 		emojis = append(emojis, "🌙 ")
 	}
-	
+
 	// Emoji-String erstellen
 	emojiString := ""
 	if len(emojis) > 0 {
 		emojiString = strings.Join(emojis, " ") + " "
 	}
-	
-	title := fmt.Sprintf(`%sWetterstatistik für Overath %s: Temperatur %.1f bis %.1f °C (Vortag: %.1f bis %.1f°C)`, 
+
+	title := fmt.Sprintf(`%sWetterstatistik für Overath %s: Temperatur %.1f bis %.1f °C (Vortag: %.1f bis %.1f°C)`,
 		emojiString,
 		startYesterday.Format("02.01.2006"),
 		statsY.tMax, statsY.tMin, statsV.tMax,
