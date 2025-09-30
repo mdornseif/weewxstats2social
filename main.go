@@ -103,7 +103,7 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 		fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) ist NULL für Tag %s\n", dayStart.Format("2006-01-02"))
 	}
 
-	// 3) Sonnenstunden wie ursprünglich: Zähle Stunden mit maxSolarRad >= sunThreshold
+	// 3) Sonnenstunden: Berechne durchschnittliche Sonneneinstrahlung pro Stunde
 	const qHourly = `
 		SELECT dateTime, rain, maxSolarRad
 		FROM archive
@@ -114,7 +114,8 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 	}
 	defer rows.Close()
 
-	seenSun := make(map[int]struct{})
+	// Sammle alle Messwerte pro Stunde
+	hourlyData := make(map[int][]float64)
 
 	for rows.Next() {
 		var ts int64
@@ -124,15 +125,31 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 			return s, err
 		}
 		h := time.Unix(ts, 0).In(loc).Hour()
-		if maxSolarRad.Valid && maxSolarRad.Float64 >= sunThreshold {
-			seenSun[h] = struct{}{}
+		if maxSolarRad.Valid {
+			hourlyData[h] = append(hourlyData[h], maxSolarRad.Float64)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return s, err
 	}
 
-	s.sunHours = len(seenSun)
+	// Berechne durchschnittliche Sonneneinstrahlung pro Stunde
+	sunHours := 0
+	for hour, values := range hourlyData {
+		if len(values) > 0 {
+			// Berechne Durchschnitt für diese Stunde
+			var sum float64
+			for _, val := range values {
+				sum += val
+			}
+			avg := sum / float64(len(values))
+			if avg >= sunThreshold {
+				sunHours++
+			}
+		}
+	}
+
+	s.sunHours = sunHours
 	return s, nil
 }
 
@@ -514,7 +531,7 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 	}
 
 	// Wetterstatistik erstellen
-	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Sonnenstunden: %d h (Vortag: %d h) Details: https://groloe.wetter.foxel.org/week.html`,
+	var weatherText = fmt.Sprintf(`Niederschlag: %.1f mm (Vortag: %.1f mm), Stunden mit Sonnenschein: %d h (Vortag: %d h) Details: https://groloe.wetter.foxel.org/week.html`,
 		statsY.rainSum, statsV.rainSum,
 		statsY.sunHours, statsV.sunHours)
 
@@ -582,10 +599,10 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 
 	// Ausgabe
 	fmt.Printf("Statistik für Overath %s: (Vortag)\n", startYesterday.Format("02.01.2006"))
-	fmt.Printf("  Höchsttemperatur:   %.1f °C (%.1f °C)\n", statsY.tMax, statsV.tMax)
-	fmt.Printf("  Tiefsttemperatur:   %.1f °C (%.1f °C)\n", statsY.tMin, statsV.tMin)
-	fmt.Printf("  Niederschlag:       %.1f mm (%.1f mm)\n", statsY.rainSum, statsV.rainSum)
-	fmt.Printf("  Sonnenstunden:      %d h (%d h)\n", statsY.sunHours, statsV.sunHours)
+	fmt.Printf("  Höchsttemperatur:         %.1f °C (%.1f °C)\n", statsY.tMax, statsV.tMax)
+	fmt.Printf("  Tiefsttemperatur:         %.1f °C (%.1f °C)\n", statsY.tMin, statsV.tMin)
+	fmt.Printf("  Niederschlag:             %.1f mm (%.1f mm)\n", statsY.rainSum, statsV.rainSum)
+	fmt.Printf("  Stunden mit Sonnenschein: %d h (%d h)\n", statsY.sunHours, statsV.sunHours)
 
 	if testMode && noaaFile != "" {
 		noaaRain, err := parseNoaaRain(noaaFile, yesterday)
