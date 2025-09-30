@@ -73,16 +73,34 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 	}
 
 	// 2) Tagesregenmenge aus archive_day_rain
-	const qRain = `SELECT sum FROM archive_day_rain WHERE dateTime >= ? AND dateTime < ? ORDER BY dateTime LIMIT 1;`
+	// Korrigierte Abfrage: Suche nach dem exakten Tag, nicht nach einem Zeitraum
+	// WeeWX speichert archive_day_rain mit dem Zeitstempel des Tagesbeginns (00:00:00)
+	dayStart := time.Unix(start, 0).In(loc)
+	dayStart = time.Date(dayStart.Year(), dayStart.Month(), dayStart.Day(), 0, 0, 0, 0, loc)
+	dayStartUnix := dayStart.Unix()
+	
+	const qRain = `SELECT sum FROM archive_day_rain WHERE dateTime = ?;`
 	var rainSum sql.NullFloat64
-	if err := db.QueryRow(qRain, start, end).Scan(&rainSum); err != nil {
-		s.rainSum = 0
-		fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) ist NULL für Zeitraum %d-%d\n", start, end)
+	if err := db.QueryRow(qRain, dayStartUnix).Scan(&rainSum); err != nil {
+		// Fallback: Versuche alternative Abfrage mit Zeitraum
+		const qRainFallback = `SELECT sum FROM archive_day_rain WHERE dateTime >= ? AND dateTime < ?;`
+		if err := db.QueryRow(qRainFallback, start, end).Scan(&rainSum); err != nil {
+			s.rainSum = 0
+			fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) nicht gefunden für Tag %s (Zeitstempel: %d)\n", dayStart.Format("2006-01-02"), dayStartUnix)
+		} else if rainSum.Valid {
+			// Korrektur: Regenmengen müssen mit 10 multipliziert werden
+			s.rainSum = rainSum.Float64 * 10.0
+		} else {
+			s.rainSum = 0
+			fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) ist NULL für Tag %s\n", dayStart.Format("2006-01-02"))
+		}
 	} else if rainSum.Valid {
-		s.rainSum = rainSum.Float64
+		// Korrektur: Regenmengen müssen mit 10 multipliziert werden
+		// Das Rain Gauge misst in 0.1mm Schritten, aber die DB speichert in 0.01mm
+		s.rainSum = rainSum.Float64 * 10.0
 	} else {
 		s.rainSum = 0
-		fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) ist NULL für Zeitraum %d-%d\n", start, end)
+		fmt.Fprintf(os.Stderr, "Warnung: Tagesregenmenge (archive_day_rain.sum) ist NULL für Tag %s\n", dayStart.Format("2006-01-02"))
 	}
 
 	// 3) Sonnenstunden wie ursprünglich: Zähle Stunden mit maxSolarRad >= sunThreshold
@@ -485,10 +503,11 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -i)
 		end := start.AddDate(0, 0, 1)
 		var rainSum sql.NullFloat64
-		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime >= ? AND dateTime < ? ORDER BY dateTime LIMIT 1;", start.UTC().Unix(), end.UTC().Unix()).Scan(&rainSum); err != nil {
+		// Korrigierte Abfrage für Trockenperiode
+		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime = ?;", start.Unix()).Scan(&rainSum); err != nil {
 			break // Fehler oder kein Eintrag -> abbrechen
 		}
-		if rainSum.Valid && rainSum.Float64 > 0 {
+		if rainSum.Valid && rainSum.Float64 * 10.0 > 0 {
 			break // Es hat geregnet
 		}
 		daysSinceRain++
@@ -505,10 +524,11 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -i)
 		end := start.AddDate(0, 0, 1)
 		var rainSum sql.NullFloat64
-		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime >= ? AND dateTime < ? ORDER BY dateTime LIMIT 1;", start.UTC().Unix(), end.UTC().Unix()).Scan(&rainSum); err != nil {
+		// Korrigierte Abfrage für Regenserien
+		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime = ?;", start.Unix()).Scan(&rainSum); err != nil {
 			break // Fehler oder kein Eintrag -> abbrechen
 		}
-		if rainSum.Valid && rainSum.Float64 > 0 {
+		if rainSum.Valid && rainSum.Float64 * 10.0 > 0 {
 			consecutiveRainDays++
 		} else {
 			break // Kein Regen -> Serie endet
