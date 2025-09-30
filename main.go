@@ -135,7 +135,7 @@ func getStats(db *sql.DB, loc *time.Location, start, end int64) (dayStats, error
 
 	// Berechne durchschnittliche Sonneneinstrahlung pro Stunde
 	sunHours := 0
-	for hour, values := range hourlyData {
+	for _, values := range hourlyData {
 		if len(values) > 0 {
 			// Berechne Durchschnitt für diese Stunde
 			var sum float64
@@ -518,7 +518,6 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 	daysSinceRain := 0
 	for i := 1; i < 30; i++ { // max. 30 Tage zurück
 		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -i)
-		end := start.AddDate(0, 0, 1)
 		var rainSum sql.NullFloat64
 		// Korrigierte Abfrage für Trockenperiode
 		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime = ?;", start.Unix()).Scan(&rainSum); err != nil {
@@ -539,7 +538,6 @@ func runWeatherPosting(dbPath string, config Config, testMode bool, loopMode boo
 	consecutiveRainDays := 0
 	for i := 1; i < 30; i++ {
 		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -i)
-		end := start.AddDate(0, 0, 1)
 		var rainSum sql.NullFloat64
 		// Korrigierte Abfrage für Regenserien
 		if err := db.QueryRow("SELECT sum FROM archive_day_rain WHERE dateTime = ?;", start.Unix()).Scan(&rainSum); err != nil {
